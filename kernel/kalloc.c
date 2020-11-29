@@ -21,13 +21,22 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+} kmem[NCPU];//定义一个结构体数组
+
+int getcpu(){//获取CPU信息
+  push_off();
+  int cpu=cpuid();
+  pop_off();
+  return cpu;
+}
 
 void
-kinit()
+kinit()//初始化NCPU个锁
 {
-  initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)PHYSTOP);
+  for(int i=0;i<NCPU;i++){
+    initlock(&kmem[i].lock,"kmem");
+  }
+  freerange(end, (void*)PHYSTOP);//freerange将全部内存分配给调用它的cpu
 }
 
 void
@@ -55,13 +64,35 @@ kfree(void *pa)
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
+  int hart = getcpu();
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  acquire(&kmem[hart].lock);
+  r->next = kmem[hart].freelist;
+  kmem[hart].freelist = r;
+  release(&kmem[hart].lock);
 }
 
+void *
+steal(int skip){
+  // printf("cpu id %d\n",getcpu());
+  struct run * rs=0;
+  for(int i=0;i<NCPU;i++){
+    // 当前cpu的锁已经在外面获取了，这里为了避免死锁，需要跳过
+    if(holding(&kmem[i].lock)){
+      continue;
+    }
+    acquire(&kmem[i].lock);//锁住
+    if(kmem[i].freelist!=0){//当前有空闲
+      rs=kmem[i].freelist;//窃取
+      kmem[i].freelist=rs->next;//调整
+      release(&kmem[i].lock);//释放锁
+      return (void *)rs;
+    }
+    release(&kmem[i].lock);
+  }
+  // 不管还有没有，都直接返回，不用panic
+  return (void *)rs;
+}
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
 // Returns 0 if the memory cannot be allocated.
@@ -70,13 +101,21 @@ kalloc(void)
 {
   struct run *r;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
+  int hart=getcpu();
+
+  acquire(&kmem[hart].lock);
+  r = kmem[hart].freelist;
   if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+    kmem[hart].freelist = r->next;
+  release(&kmem[hart].lock);
+  if(!r)
+  {
+    //borrow from other CPU's freelist
+    r = steal(hart);
+  }
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
